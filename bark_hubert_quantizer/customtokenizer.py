@@ -9,21 +9,52 @@ import os.path
 from zipfile import ZipFile
 
 import numpy
+import math
 import torch
-from torch import nn, optim
+from torch import Tensor, nn, optim
 from torch.serialization import MAP_LOCATION
 
+
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
+
+class PositionalEncoding(nn.Module):
+
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Arguments:
+            x: Tensor, shape ``[seq_len, batch_size, embedding_dim]``
+        """
+        x = x + self.pe[:x.size(0), :x.size(1)]
+        return self.dropout(x)
 
 class CustomTokenizer(nn.Module):
     def __init__(self, hidden_size=1024, input_size=768, output_size=10000, version=0):
         super(CustomTokenizer, self).__init__()
         next_size = input_size
+
+        self.pos_encoder = PositionalEncoding(d_model=input_size)
+
+        # Replace LSTM with Transformer Encoder
         if version == 0:
-            self.lstm = nn.LSTM(input_size, hidden_size, 2, batch_first=True)
-            next_size = hidden_size
+            encoder_layers = TransformerEncoderLayer(d_model=input_size, nhead=4, dim_feedforward=hidden_size)
+            self.transformer_encoder = TransformerEncoder(encoder_layers, num_layers=6)
+            next_size = input_size  # Transformer does not change the feature dimension
+        
         if version == 1:
-            self.lstm = nn.LSTM(input_size, hidden_size, 2, batch_first=True)
-            self.intermediate = nn.Linear(hidden_size, 4096)
+            encoder_layers = TransformerEncoderLayer(d_model=input_size, nhead=4, dim_feedforward=hidden_size)
+            self.transformer_encoder = TransformerEncoder(encoder_layers, num_layers=6)
+            self.intermediate = nn.Linear(input_size, 4096)  # Note: Adjust this based on your needs
             next_size = 4096
 
         self.fc = nn.Linear(next_size, output_size)
@@ -36,12 +67,17 @@ class CustomTokenizer(nn.Module):
         self.version = version
 
     def forward(self, x):
-        x, _ = self.lstm(x)
+        # Replace LSTM with Transformer
+        x = self.pos_encoder(x)
+        x = self.transformer_encoder(x)
+        
         if self.version == 1:
             x = self.intermediate(x)
+        
         x = self.fc(x)
         x = self.softmax(x)
         return x
+
 
     @torch.no_grad()
     def get_token(self, x):
@@ -53,7 +89,7 @@ class CustomTokenizer(nn.Module):
         return torch.argmax(self(x), dim=1)
 
     def prepare_training(self):
-        self.optimizer = optim.Adam(self.parameters(), 0.001)
+        self.optimizer = optim.AdamW(self.parameters(), 0.001)
 
     def train_step(self, x_train, y_train, log_loss=False):
         # y_train = y_train[:-1]
@@ -158,7 +194,7 @@ def auto_train(data_path, save_path='model.pth', load_model: str | None = None, 
         model_training = CustomTokenizer.load_from_checkpoint(load_model, 'cuda')
     else:
         print('Creating new model.')
-        model_training = CustomTokenizer(version=1).to('cuda')
+        model_training = CustomTokenizer(version=0).to('cuda')
     save_path = os.path.join(data_path, save_path)
     base_save_path = '.'.join(save_path.split('.')[:-1])
 
