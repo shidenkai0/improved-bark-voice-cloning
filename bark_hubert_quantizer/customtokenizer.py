@@ -81,7 +81,6 @@ class CustomTokenizer(nn.Module):
             x = self.intermediate(x)
         
         x = self.fc(x)
-        x = self.softmax(x)
         return x
 
 
@@ -117,19 +116,18 @@ class CustomTokenizer(nn.Module):
             diff = y_pred_len - y_train_len
             y_pred = y_pred[:-diff, :]
 
-        y_train_hot = torch.zeros(len(y_train), self.output_size)
-        y_train_hot[range(len(y_train)), y_train] = 1
-        y_train_hot = y_train_hot.to('cuda')
 
         # TODO: Continue this investigation
         # if step_number == 1:
         #     print(x_train.shape, y_train.shape)
         #     print(y_pred.shape, y_train_hot.shape)
         #     # print every non-zero value of y_train_hot
-        #     print(y_train_hot[y_train_hot != 0])
+        #     print(f'Non-zero values of y_train: {y_train[y_train != 0]}')
+        #     # print every non-zero value of y_pred
+        #     print(f'Non-zero values of y_pred: {y_pred[y_pred != 0]}')
 
         # Calculate the loss
-        sample_loss = lossfunc(y_pred, y_train_hot)
+        sample_loss = lossfunc(y_pred, y_train)
 
         loss = sample_loss / self.batch_size
 
@@ -230,25 +228,51 @@ def auto_train(data_path, save_path='model.pth', load_model: str | None = None, 
     model_training.prepare_training()
     epoch = 1
     num_training_data = max(len(data_x), len(data_y))
+    train_size = int(0.9 * num_training_data)
+    valid_size = num_training_data - train_size
+
+    # Print length of data_x and data_y
+    print(f'Length of data_x: {len(data_x)} / data_y: {len(data_y)}')
+
+    keys = sorted(data_x.keys())
+    
+    data_x_train = {k: data_x[k] for k in keys[:train_size]}
+    data_y_train = {k: data_y[k] for k in keys[:train_size]}
+    data_x_valid = {k: data_x[k] for k in keys[train_size:]}
+    data_y_valid = {k: data_y[k] for k in keys[train_size:]}
+
+    print(f'Length of data_x_train: {len(data_x_train)} / data_y_train: {len(data_y_train)}')
 
     while 1:
         losses_for_epoch = []
-        for i in range(save_epochs):
-            j = 0
-            for i in range(num_training_data):
-                x = data_x.get(i)
-                y = data_y.get(i)
-                if x is None or y is None:
-                    print(f'The training data does not match. key={i}')
-                    continue
-                loss = model_training.train_step(torch.tensor(x).to('cuda'), torch.tensor(y).to('cuda'), i, num_training_data)
-                losses_for_epoch.append(loss.item())
-                if j % 100 == 0:
-                    print(f'Epoch {epoch}, step {j}, loss {loss.item()}')
-                j += 1
+        for train_step in range(train_size):
+            x = data_x_train.get(train_step)
+            y = data_y_train.get(train_step)
+            if x is None or y is None:
+                print(f'The training data does not match. key={train_step}')
+                continue
+            loss = model_training.train_step(torch.tensor(x).to('cuda'), torch.tensor(y).to('cuda'), train_step, train_size)
+            losses_for_epoch.append(loss.item())
+        
+        # Validation loop
+        model_training.eval()
+        valid_losses = []
+        for i in range(valid_size):
+            x = data_x_valid.get(i)
+            y = data_y_valid.get(i)
+            if x is None or y is None:
+                continue
+            with torch.no_grad():
+                y_pred = model_training(torch.tensor(x).to('cuda'))
+                loss = model_training.lossfunc(y_pred, torch.tensor(y).to('cuda'))
+                valid_losses.append(loss.item())
+        model_training.train()
+
         save_p = save_path
         save_p_2 = f'{base_save_path}_epoch_{epoch}.pth'
         model_training.save(save_p)
         model_training.save(save_p_2)
-        print(f'Epoch {epoch} completed with loss avg {sum(losses_for_epoch) / len(losses_for_epoch)} / min {min(losses_for_epoch)}/ max {max(losses_for_epoch)}')
+        print(f"Epoch {epoch} completed.")
+        print(f'Training loss avg {sum(losses_for_epoch) / len(losses_for_epoch)} / min {min(losses_for_epoch)}/ max {max(losses_for_epoch)}')
+        print(f'Validation loss avg {sum(valid_losses) / len(valid_losses)} / min {min(valid_losses)}/ max {max(valid_losses)}')
         epoch += 1
