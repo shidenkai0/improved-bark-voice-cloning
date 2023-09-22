@@ -1,7 +1,12 @@
 /model
 /Literature/semantic/*
 /Literature/wav/*
+/Literature
 **/speaker.wav
 **/speaker.npz
-
+*.npz
+*.wav
+*.npy
+*.pth
 __pycache__
+.venv

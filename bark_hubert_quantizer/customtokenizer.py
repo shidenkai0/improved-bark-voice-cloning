@@ -39,23 +39,29 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 class CustomTokenizer(nn.Module):
-    def __init__(self, hidden_size=1024, input_size=768, output_size=10000, version=0):
+    def __init__(self, hidden_size=1024, input_size=768, output_size=10000, version=0, batch_size=1):
         super(CustomTokenizer, self).__init__()
         next_size = input_size
 
         self.pos_encoder = PositionalEncoding(d_model=input_size)
 
         # Replace LSTM with Transformer Encoder
-        if version == 0:
-            encoder_layers = TransformerEncoderLayer(d_model=input_size, nhead=4, dim_feedforward=hidden_size)
-            self.transformer_encoder = TransformerEncoder(encoder_layers, num_layers=6)
-            next_size = input_size  # Transformer does not change the feature dimension
+        encoder_layers = TransformerEncoderLayer(d_model=input_size, nhead=8, dim_feedforward=hidden_size)
+        self.transformer_encoder = TransformerEncoder(encoder_layers, num_layers=8)
+        next_size = input_size  # Transformer does not change the feature dimension
+
+        # for layer in self.transformer_encoder.layers:
+        #     nn.init.xavier_uniform_(layer.self_attn.in_proj_weight)
+        #     nn.init.xavier_uniform_(layer.self_attn.out_proj.weight)
+            
+        #     nn.init.kaiming_normal_(layer.linear1.weight, nonlinearity='relu')
+        #     nn.init.kaiming_normal_(layer.linear2.weight, nonlinearity='relu')
+        #     if layer.self_attn.in_proj_bias is not None:
+        #         nn.init.zeros_(layer.self_attn.in_proj_bias)
+        #     if layer.self_attn.out_proj.bias is not None:
+        #         nn.init.zeros_(layer.self_attn.out_proj.bias)
         
-        if version == 1:
-            encoder_layers = TransformerEncoderLayer(d_model=input_size, nhead=4, dim_feedforward=hidden_size)
-            self.transformer_encoder = TransformerEncoder(encoder_layers, num_layers=6)
-            self.intermediate = nn.Linear(input_size, 4096)  # Note: Adjust this based on your needs
-            next_size = 4096
+        self.batch_size = batch_size
 
         self.fc = nn.Linear(next_size, output_size)
         self.softmax = nn.LogSoftmax(dim=1)
@@ -89,16 +95,14 @@ class CustomTokenizer(nn.Module):
         return torch.argmax(self(x), dim=1)
 
     def prepare_training(self):
-        self.optimizer = optim.AdamW(self.parameters(), 0.001)
+        self.optimizer = optim.AdamW(self.parameters(), 1e-5)
 
-    def train_step(self, x_train, y_train, log_loss=False):
+    def train_step(self, x_train, y_train, step_number, num_training_samples):
         # y_train = y_train[:-1]
         # y_train = y_train[1:]
 
         optimizer = self.optimizer
         lossfunc = self.lossfunc
-        # Zero the gradients
-        self.zero_grad()
 
         # Forward pass
         y_pred = self(x_train)
@@ -117,18 +121,27 @@ class CustomTokenizer(nn.Module):
         y_train_hot[range(len(y_train)), y_train] = 1
         y_train_hot = y_train_hot.to('cuda')
 
-        # Calculate the loss
-        loss = lossfunc(y_pred, y_train_hot)
+        # TODO: Continue this investigation
+        # if step_number == 1:
+        #     print(x_train.shape, y_train.shape)
+        #     print(y_pred.shape, y_train_hot.shape)
+        #     # print every non-zero value of y_train_hot
+        #     print(y_train_hot[y_train_hot != 0])
 
-        # Print loss
-        if log_loss:
-            print('Loss', loss.item())
+        # Calculate the loss
+        sample_loss = lossfunc(y_pred, y_train_hot)
+
+        loss = sample_loss / self.batch_size
 
         # Backward pass
         loss.backward()
 
-        # Update the weights
-        optimizer.step()
+        # Update weights
+        if step_number % self.batch_size == 0 or step_number == num_training_samples - 1:
+            optimizer.step()
+            optimizer.zero_grad()
+
+        return sample_loss
 
     def save(self, path):
         info_path = '.'.join(os.path.basename(path).split('.')[:-1]) + '/.info'
@@ -216,21 +229,26 @@ def auto_train(data_path, save_path='model.pth', load_model: str | None = None, 
     
     model_training.prepare_training()
     epoch = 1
+    num_training_data = max(len(data_x), len(data_y))
 
     while 1:
+        losses_for_epoch = []
         for i in range(save_epochs):
             j = 0
-            for i in range(max(len(data_x), len(data_y))):
+            for i in range(num_training_data):
                 x = data_x.get(i)
                 y = data_y.get(i)
                 if x is None or y is None:
                     print(f'The training data does not match. key={i}')
                     continue
-                model_training.train_step(torch.tensor(x).to('cuda'), torch.tensor(y).to('cuda'), j % 50 == 0)  # Print loss every 50 steps
+                loss = model_training.train_step(torch.tensor(x).to('cuda'), torch.tensor(y).to('cuda'), i, num_training_data)
+                losses_for_epoch.append(loss.item())
+                if j % 100 == 0:
+                    print(f'Epoch {epoch}, step {j}, loss {loss.item()}')
                 j += 1
         save_p = save_path
         save_p_2 = f'{base_save_path}_epoch_{epoch}.pth'
         model_training.save(save_p)
         model_training.save(save_p_2)
-        print(f'Epoch {epoch} completed')
+        print(f'Epoch {epoch} completed with loss avg {sum(losses_for_epoch) / len(losses_for_epoch)} / min {min(losses_for_epoch)}/ max {max(losses_for_epoch)}')
         epoch += 1

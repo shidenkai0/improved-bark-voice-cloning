@@ -5,7 +5,7 @@ import zipfile
 import numpy
 import torchaudio
 
-from hubert.pre_kmeans_hubert import CustomHubert
+from bark_hubert_quantizer.pre_kmeans_hubert import CustomHubert
 
 import torch
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

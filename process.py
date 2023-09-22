@@ -3,7 +3,7 @@ import os.path
 from args import args
 from prepare import prepare, prepare2
 from test_hubert import test_hubert
-from hubert.customtokenizer import auto_train
+from bark_hubert_quantizer.customtokenizer import auto_train
 
 path = args.path
 mode = args.mode

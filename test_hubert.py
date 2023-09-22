@@ -4,8 +4,8 @@ import numpy
 import torch
 import torchaudio
 
-from hubert.customtokenizer import CustomTokenizer
-from hubert.pre_kmeans_hubert import CustomHubert
+from bark_hubert_quantizer.customtokenizer import CustomTokenizer
+from bark_hubert_quantizer.pre_kmeans_hubert import CustomHubert
 
 
 def test_hubert(path: str, model: str = 'model/hubert/hubert_base_ls960.pt', tokenizer: str = 'model.pth'):
