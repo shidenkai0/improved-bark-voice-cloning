@@ -13,6 +13,7 @@ import math
 import torch
 from torch import Tensor, nn, optim
 from torch.serialization import MAP_LOCATION
+from torch.utils.data import Dataset, DataLoader
 
 
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
@@ -103,7 +104,7 @@ class CustomTokenizer(nn.Module):
         self.optimizer = optim.AdamW(self.parameters(), 1e-3)
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', patience=5, factor=0.5, threshold=1e-3, verbose=True)
 
-    def train_step(self, x_train, y_train, step_number, num_training_samples):
+    def train_step(self, x_train, y_train):
         # y_train = y_train[:-1]
         # y_train = y_train[1:]
 
@@ -142,9 +143,8 @@ class CustomTokenizer(nn.Module):
         loss.backward()
 
         # Update weights
-        if step_number % self.batch_size == 0 or step_number == num_training_samples - 1:
-            optimizer.step()
-            optimizer.zero_grad()
+        optimizer.step()
+        optimizer.zero_grad()
 
         return sample_loss
 
@@ -175,6 +175,17 @@ class CustomTokenizer(nn.Module):
             model = model.to(map_location)
         return model
 
+
+class CustomDataset(Dataset):
+    def __init__(self, data_x, data_y):
+        self.data_x = list(data_x.values())
+        self.data_y = list(data_y.values())
+
+    def __len__(self):
+        return len(self.data_x)
+
+    def __getitem__(self, index):
+        return torch.tensor(self.data_x[index]), torch.tensor(self.data_y[index])
 
 
 class Data:
@@ -230,10 +241,8 @@ def auto_train(data_path, save_path='model.pth', load_model: str | None = None):
             data_x[number] = numpy.load(full_path)
     
     model_training.prepare_training()
-    epoch = 1
     data_size = max(len(data_x), len(data_y))
     train_size = int(0.9 * data_size)
-    valid_size = data_size - train_size
 
     # Print length of data_x and data_y
     print(f'Length of data_x: {len(data_x)} / data_y: {len(data_y)}')
@@ -249,43 +258,41 @@ def auto_train(data_path, save_path='model.pth', load_model: str | None = None):
     data_x_valid = {k: data_x[k] for k in keys[train_size:]}
     data_y_valid = {k: data_y[k] for k in keys[train_size:]}
 
+    train_dataset = CustomDataset(data_x_train, data_y_train)
+    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
+
+    valid_dataset = CustomDataset(data_x_valid, data_y_valid)
+    valid_loader = DataLoader(valid_dataset, batch_size=1, shuffle=False)
+
     print(f'Length of data_x_train: {len(data_x_train)} / data_y_train: {len(data_y_train)}')
 
+    epoch = 1
     while 1:
         losses_for_epoch = []
-        for train_step, key in enumerate(data_x_train):
-            x = data_x_train.get(key)
-            y = data_y_train.get(key)
-            if x is None or y is None:
-                print(f'The training data does not match. key={train_step}')
-                continue
-            loss = model_training.train_step(torch.tensor(x).to('cuda'), torch.tensor(y).to('cuda'), train_step, train_size)
+        for x, y in train_loader:
+            x, y = x.to('cuda').squeeze(0), y.to('cuda').squeeze(0)
+            loss = model_training.train_step(x, y)
             losses_for_epoch.append(loss.item())
+
         
         # Validation loop
         model_training.eval()
         valid_losses = []
-        for _, key in enumerate(data_x_valid):
-            x = data_x_valid.get(key)
-            y = data_y_valid.get(key)
-
-            if x is None or y is None:
-                continue
+        for x, y in valid_loader:
+            x, y = x.to('cuda').squeeze(0), y.to('cuda').squeeze(0)
             with torch.no_grad():
-                y_pred = model_training(torch.tensor(x).to('cuda'))
-
-                y_len = len(y)
+                y_pred = model_training(x)
                 y_pred_len = y_pred.shape[0]
-
-                if y_len > y_pred_len:
-                    diff = y_len - y_pred_len
-                    y = y[diff:]
-                elif y_len < y_pred_len:
+                y_len = y.size(0)
+                
+                if y_pred_len > y_len:
                     diff = y_pred_len - y_len
                     y_pred = y_pred[:-diff, :]
+                elif y_pred_len < y_len:
+                    diff = y_len - y_pred_len
+                    y = y[diff:]
 
-                    
-                loss = model_training.lossfunc(y_pred, torch.tensor(y).to('cuda'))
+                loss = model_training.lossfunc(y_pred, y)
                 valid_losses.append(loss.item())
         model_training.train()
 
