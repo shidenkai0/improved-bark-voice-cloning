@@ -39,16 +39,22 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 class CustomTokenizer(nn.Module):
-    def __init__(self, hidden_size=1024, input_size=768, output_size=10000, version=0, batch_size=1):
+    def __init__(self, hidden_size=1024, input_size=768, output_size=10000, batch_size=1, transformer=False):
         super(CustomTokenizer, self).__init__()
         next_size = input_size
 
-        self.pos_encoder = PositionalEncoding(d_model=input_size)
+        self.transformer = transformer
 
-        # Replace LSTM with Transformer Encoder
-        encoder_layers = TransformerEncoderLayer(d_model=input_size, nhead=8, dim_feedforward=hidden_size)
-        self.transformer_encoder = TransformerEncoder(encoder_layers, num_layers=8)
-        next_size = input_size  # Transformer does not change the feature dimension
+        if transformer:
+            # Replace LSTM with Transformer Encoder
+            self.pos_encoder = PositionalEncoding(d_model=input_size)
+            encoder_layers = TransformerEncoderLayer(d_model=input_size, nhead=8, dim_feedforward=hidden_size)
+            self.transformer_encoder = TransformerEncoder(encoder_layers, num_layers=10)
+            next_size = input_size  # Transformer does not change the feature dimension
+        else:
+            self.lstm = nn.LSTM(input_size, hidden_size, 2, batch_first=True)
+            self.intermediate = nn.Linear(hidden_size, 4096)
+            next_size = 4096
 
         # for layer in self.transformer_encoder.layers:
         #     nn.init.xavier_uniform_(layer.self_attn.in_proj_weight)
@@ -66,18 +72,18 @@ class CustomTokenizer(nn.Module):
         self.fc = nn.Linear(next_size, output_size)
         self.softmax = nn.LogSoftmax(dim=1)
         self.optimizer: optim.Optimizer = None
+        self.scheduler: optim.lr_scheduler = None
         self.lossfunc = nn.CrossEntropyLoss()
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.output_size = output_size
-        self.version = version
 
     def forward(self, x):
-        # Replace LSTM with Transformer
-        x = self.pos_encoder(x)
-        x = self.transformer_encoder(x)
-        
-        if self.version == 1:
+        if self.transformer:
+            x = self.pos_encoder(x)
+            x = self.transformer_encoder(x)
+        else:
+            x, _ = self.lstm(x)
             x = self.intermediate(x)
         
         x = self.fc(x)
@@ -94,7 +100,8 @@ class CustomTokenizer(nn.Module):
         return torch.argmax(self(x), dim=1)
 
     def prepare_training(self):
-        self.optimizer = optim.AdamW(self.parameters(), 1e-5)
+        self.optimizer = optim.AdamW(self.parameters(), 1e-3)
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', patience=5, factor=0.5, threshold=1e-3, verbose=True)
 
     def train_step(self, x_train, y_train, step_number, num_training_samples):
         # y_train = y_train[:-1]
@@ -144,7 +151,7 @@ class CustomTokenizer(nn.Module):
     def save(self, path):
         info_path = '.'.join(os.path.basename(path).split('.')[:-1]) + '/.info'
         torch.save(self.state_dict(), path)
-        data_from_model = Data(self.input_size, self.hidden_size, self.output_size, self.version)
+        data_from_model = Data(self.input_size, self.hidden_size, self.output_size)
         with ZipFile(path, 'a') as model_zip:
             model_zip.writestr(info_path, data_from_model.save())
             model_zip.close()
@@ -162,7 +169,7 @@ class CustomTokenizer(nn.Module):
         if old:
             model = CustomTokenizer()
         else:
-            model = CustomTokenizer(data_from_model.hidden_size, data_from_model.input_size, data_from_model.output_size, data_from_model.version)
+            model = CustomTokenizer(data_from_model.hidden_size, data_from_model.input_size, data_from_model.output_size)
         model.load_state_dict(torch.load(path, map_location=map_location))
         if map_location:
             model = model.to(map_location)
@@ -174,30 +181,27 @@ class Data:
     input_size: int
     hidden_size: int
     output_size: int
-    version: int
 
-    def __init__(self, input_size=768, hidden_size=1024, output_size=10000, version=0):
+    def __init__(self, input_size=768, hidden_size=1024, output_size=10000):
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.output_size = output_size
-        self.version = version
 
     @staticmethod
     def load(string):
         data = json.loads(string)
-        return Data(data['input_size'], data['hidden_size'], data['output_size'], data['version'])
+        return Data(data['input_size'], data['hidden_size'], data['output_size'])
 
     def save(self):
         data = {
             'input_size': self.input_size,
             'hidden_size': self.hidden_size,
             'output_size': self.output_size,
-            'version': self.version,
         }
         return json.dumps(data)
 
 
-def auto_train(data_path, save_path='model.pth', load_model: str | None = None, save_epochs=1):
+def auto_train(data_path, save_path='model.pth', load_model: str | None = None):
     data_x, data_y = {}, {}
 
     if load_model and os.path.isfile(load_model):
@@ -205,7 +209,7 @@ def auto_train(data_path, save_path='model.pth', load_model: str | None = None, 
         model_training = CustomTokenizer.load_from_checkpoint(load_model, 'cuda')
     else:
         print('Creating new model.')
-        model_training = CustomTokenizer(version=0).to('cuda')
+        model_training = CustomTokenizer().to('cuda')
     save_path = os.path.join(data_path, save_path)
     base_save_path = '.'.join(save_path.split('.')[:-1])
 
@@ -227,14 +231,18 @@ def auto_train(data_path, save_path='model.pth', load_model: str | None = None, 
     
     model_training.prepare_training()
     epoch = 1
-    num_training_data = max(len(data_x), len(data_y))
-    train_size = int(0.9 * num_training_data)
-    valid_size = num_training_data - train_size
+    data_size = max(len(data_x), len(data_y))
+    train_size = int(0.9 * data_size)
+    valid_size = data_size - train_size
 
     # Print length of data_x and data_y
     print(f'Length of data_x: {len(data_x)} / data_y: {len(data_y)}')
 
     keys = sorted(data_x.keys())
+
+    numpy.random.seed(42)
+    numpy.random.shuffle(keys)
+    print(f'Keys: {keys[:20]}')
     
     data_x_train = {k: data_x[k] for k in keys[:train_size]}
     data_y_train = {k: data_y[k] for k in keys[:train_size]}
@@ -245,9 +253,9 @@ def auto_train(data_path, save_path='model.pth', load_model: str | None = None, 
 
     while 1:
         losses_for_epoch = []
-        for train_step in range(train_size):
-            x = data_x_train.get(train_step)
-            y = data_y_train.get(train_step)
+        for train_step, key in enumerate(data_x_train):
+            x = data_x_train.get(key)
+            y = data_y_train.get(key)
             if x is None or y is None:
                 print(f'The training data does not match. key={train_step}')
                 continue
@@ -257,16 +265,32 @@ def auto_train(data_path, save_path='model.pth', load_model: str | None = None, 
         # Validation loop
         model_training.eval()
         valid_losses = []
-        for i in range(valid_size):
-            x = data_x_valid.get(i)
-            y = data_y_valid.get(i)
+        for _, key in enumerate(data_x_valid):
+            x = data_x_valid.get(key)
+            y = data_y_valid.get(key)
+
             if x is None or y is None:
                 continue
             with torch.no_grad():
                 y_pred = model_training(torch.tensor(x).to('cuda'))
+
+                y_len = len(y)
+                y_pred_len = y_pred.shape[0]
+
+                if y_len > y_pred_len:
+                    diff = y_len - y_pred_len
+                    y = y[diff:]
+                elif y_len < y_pred_len:
+                    diff = y_pred_len - y_len
+                    y_pred = y_pred[:-diff, :]
+
+                    
                 loss = model_training.lossfunc(y_pred, torch.tensor(y).to('cuda'))
                 valid_losses.append(loss.item())
         model_training.train()
+
+        avg_valid_loss = sum(valid_losses) / len(valid_losses)
+        model_training.scheduler.step(avg_valid_loss)
 
         save_p = save_path
         save_p_2 = f'{base_save_path}_epoch_{epoch}.pth'
