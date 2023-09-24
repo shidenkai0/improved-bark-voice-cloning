@@ -14,6 +14,7 @@ import torch
 from torch import Tensor, nn, optim
 from torch.serialization import MAP_LOCATION
 from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
 
 
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
@@ -26,9 +27,9 @@ class PositionalEncoding(nn.Module):
 
         position = torch.arange(max_len).unsqueeze(1)
         div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(max_len, d_model)
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = torch.zeros(max_len, 1, d_model)
+        pe[:, 0, 0::2] = torch.sin(position * div_term)
+        pe[:, 0, 1::2] = torch.cos(position * div_term)
         self.register_buffer('pe', pe)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -36,11 +37,40 @@ class PositionalEncoding(nn.Module):
         Arguments:
             x: Tensor, shape ``[seq_len, batch_size, embedding_dim]``
         """
-        x = x + self.pe[:x.size(0), :x.size(1)]
+        x = x + self.pe[:x.size(0)]
         return self.dropout(x)
 
+
+def masked_loss(lossfunc, y_pred, y_true):
+    """
+    Computes the loss while ignoring padded values.
+
+    Args:
+        lossfunc: The loss function to use.
+        y_pred: The predicted values of shape (seq_len, batch_size, embedding_dim).
+        y_true: The true values of shape (batch_size, seq_len).
+    """
+
+    # Create a mask for non-padded values
+    mask = y_true != 0
+    
+    # Check and handle mismatch in sequence length
+    if y_pred.size(0) != y_true.size(1):
+        seq_len = min(y_pred.size(0), y_true.size(1))
+        y_pred = y_pred[:seq_len]
+        y_true = y_true[:, :seq_len]
+        mask = mask[:, :seq_len]
+    
+    # Adjust mask dimensions to match y_pred's dimensions
+    mask_expanded = mask.unsqueeze(-1).expand_as(y_pred.permute(1, 0, 2))
+    
+    # Apply the mask and compute the loss
+    loss = lossfunc(y_pred.permute(1, 0, 2)[mask_expanded].view(-1, y_pred.size(-1)), y_true[mask].view(-1))
+    return loss
+
+
 class CustomTokenizer(nn.Module):
-    def __init__(self, hidden_size=1024, input_size=768, output_size=10000, batch_size=1, transformer=False):
+    def __init__(self, hidden_size=1024, input_size=768, output_size=10000, batch_size=8, transformer=False):
         super(CustomTokenizer, self).__init__()
         next_size = input_size
 
@@ -53,7 +83,7 @@ class CustomTokenizer(nn.Module):
             self.transformer_encoder = TransformerEncoder(encoder_layers, num_layers=10)
             next_size = input_size  # Transformer does not change the feature dimension
         else:
-            self.lstm = nn.LSTM(input_size, hidden_size, 2, batch_first=True)
+            self.lstm = nn.LSTM(input_size, hidden_size, 2, batch_first=False)
             self.intermediate = nn.Linear(hidden_size, 4096)
             next_size = 4096
 
@@ -80,6 +110,8 @@ class CustomTokenizer(nn.Module):
         self.output_size = output_size
 
     def forward(self, x):
+        x = x.permute(1, 0, 2) # (batch_size, seq_len, input_size) -> (seq_len, batch_size, input_size)
+        
         if self.transformer:
             x = self.pos_encoder(x)
             x = self.transformer_encoder(x)
@@ -88,6 +120,7 @@ class CustomTokenizer(nn.Module):
             x = self.intermediate(x)
         
         x = self.fc(x)
+        x = self.softmax(x)
         return x
 
 
@@ -114,30 +147,8 @@ class CustomTokenizer(nn.Module):
         # Forward pass
         y_pred = self(x_train)
 
-        y_train_len = len(y_train)
-        y_pred_len = y_pred.shape[0]
-
-        if y_train_len > y_pred_len:
-            diff = y_train_len - y_pred_len
-            y_train = y_train[diff:]
-        elif y_train_len < y_pred_len:
-            diff = y_pred_len - y_train_len
-            y_pred = y_pred[:-diff, :]
-
-
-        # TODO: Continue this investigation
-        # if step_number == 1:
-        #     print(x_train.shape, y_train.shape)
-        #     print(y_pred.shape, y_train_hot.shape)
-        #     # print every non-zero value of y_train_hot
-        #     print(f'Non-zero values of y_train: {y_train[y_train != 0]}')
-        #     # print every non-zero value of y_pred
-        #     print(f'Non-zero values of y_pred: {y_pred[y_pred != 0]}')
-
         # Calculate the loss
-        sample_loss = lossfunc(y_pred, y_train)
-
-        loss = sample_loss / self.batch_size
+        loss = masked_loss(lossfunc, y_pred, y_train)
 
         # Backward pass
         loss.backward()
@@ -146,7 +157,7 @@ class CustomTokenizer(nn.Module):
         optimizer.step()
         optimizer.zero_grad()
 
-        return sample_loss
+        return loss
 
     def save(self, path):
         info_path = '.'.join(os.path.basename(path).split('.')[:-1]) + '/.info'
@@ -175,11 +186,16 @@ class CustomTokenizer(nn.Module):
             model = model.to(map_location)
         return model
 
-
 class CustomDataset(Dataset):
     def __init__(self, data_x, data_y):
         self.data_x = list(data_x.values())
         self.data_y = list(data_y.values())
+
+    def collate_fn(self, batch):
+        x_list, y_list = zip(*batch)
+        x_padded = pad_sequence(x_list, batch_first=True)
+        y_padded = pad_sequence(y_list, batch_first=True)
+        return x_padded, y_padded
 
     def __len__(self):
         return len(self.data_x)
@@ -259,10 +275,10 @@ def auto_train(data_path, save_path='model.pth', load_model: str | None = None):
     data_y_valid = {k: data_y[k] for k in keys[train_size:]}
 
     train_dataset = CustomDataset(data_x_train, data_y_train)
-    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_size=model_training.batch_size, shuffle=True, collate_fn=train_dataset.collate_fn)
 
     valid_dataset = CustomDataset(data_x_valid, data_y_valid)
-    valid_loader = DataLoader(valid_dataset, batch_size=1, shuffle=False)
+    valid_loader = DataLoader(valid_dataset, batch_size=model_training.batch_size, shuffle=False, collate_fn=valid_dataset.collate_fn)
 
     print(f'Length of data_x_train: {len(data_x_train)} / data_y_train: {len(data_y_train)}')
 
@@ -270,7 +286,7 @@ def auto_train(data_path, save_path='model.pth', load_model: str | None = None):
     while 1:
         losses_for_epoch = []
         for x, y in train_loader:
-            x, y = x.to('cuda').squeeze(0), y.to('cuda').squeeze(0)
+            x, y = x.to('cuda'), y.to('cuda')
             loss = model_training.train_step(x, y)
             losses_for_epoch.append(loss.item())
 
@@ -279,20 +295,10 @@ def auto_train(data_path, save_path='model.pth', load_model: str | None = None):
         model_training.eval()
         valid_losses = []
         for x, y in valid_loader:
-            x, y = x.to('cuda').squeeze(0), y.to('cuda').squeeze(0)
+            x, y = x.to('cuda'), y.to('cuda')
             with torch.no_grad():
                 y_pred = model_training(x)
-                y_pred_len = y_pred.shape[0]
-                y_len = y.size(0)
-                
-                if y_pred_len > y_len:
-                    diff = y_pred_len - y_len
-                    y_pred = y_pred[:-diff, :]
-                elif y_pred_len < y_len:
-                    diff = y_len - y_pred_len
-                    y = y[diff:]
-
-                loss = model_training.lossfunc(y_pred, y)
+                loss = masked_loss(model_training.lossfunc, y_pred, y)
                 valid_losses.append(loss.item())
         model_training.train()
 
