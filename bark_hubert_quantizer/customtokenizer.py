@@ -4,6 +4,7 @@ Author: https://www.github.com/gitmylo/
 License: MIT
 """
 
+import time
 import json
 import os.path
 from zipfile import ZipFile
@@ -70,7 +71,7 @@ def masked_loss(lossfunc, y_pred, y_true):
 
 
 class CustomTokenizer(nn.Module):
-    def __init__(self, hidden_size=1024, input_size=768, output_size=10000, batch_size=8, transformer=False):
+    def __init__(self, hidden_size=1024, input_size=768, output_size=10000, batch_size=4, transformer=True):
         super(CustomTokenizer, self).__init__()
         next_size = input_size
 
@@ -79,13 +80,13 @@ class CustomTokenizer(nn.Module):
         if transformer:
             # Replace LSTM with Transformer Encoder
             self.pos_encoder = PositionalEncoding(d_model=input_size)
-            encoder_layers = TransformerEncoderLayer(d_model=input_size, nhead=8, dim_feedforward=hidden_size)
-            self.transformer_encoder = TransformerEncoder(encoder_layers, num_layers=10)
+            encoder_layers = TransformerEncoderLayer(d_model=input_size, nhead=8, dim_feedforward=3072)
+            self.transformer_encoder = TransformerEncoder(encoder_layers, num_layers=6)
             next_size = input_size  # Transformer does not change the feature dimension
         else:
             self.lstm = nn.LSTM(input_size, hidden_size, 2, batch_first=False)
-            self.intermediate = nn.Linear(hidden_size, 4096)
-            next_size = 4096
+            # self.intermediate = nn.Linear(hidden_size, 4096)
+            next_size = hidden_size
 
         # for layer in self.transformer_encoder.layers:
         #     nn.init.xavier_uniform_(layer.self_attn.in_proj_weight)
@@ -117,10 +118,10 @@ class CustomTokenizer(nn.Module):
             x = self.transformer_encoder(x)
         else:
             x, _ = self.lstm(x)
-            x = self.intermediate(x)
+            # x = self.intermediate(x)
         
         x = self.fc(x)
-        x = self.softmax(x)
+        # x = self.softmax(x)
         return x
 
 
@@ -134,7 +135,8 @@ class CustomTokenizer(nn.Module):
         return torch.argmax(self(x), dim=1)
 
     def prepare_training(self):
-        self.optimizer = optim.AdamW(self.parameters(), 1e-3)
+        lr = 1e-5 if self.transformer else 1e-3
+        self.optimizer = optim.Adam(self.parameters(), lr)
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min', patience=5, factor=0.5, threshold=1e-3, verbose=True)
 
     def train_step(self, x_train, y_train):
@@ -228,7 +230,7 @@ class Data:
         return json.dumps(data)
 
 
-def auto_train(data_path, save_path='model.pth', load_model: str | None = None):
+def auto_train(data_path, save_path='model.pth', load_model: str | None = None, eval_only=False, train_epochs=25):
     data_x, data_y = {}, {}
 
     if load_model and os.path.isfile(load_model):
@@ -267,7 +269,7 @@ def auto_train(data_path, save_path='model.pth', load_model: str | None = None):
 
     numpy.random.seed(42)
     numpy.random.shuffle(keys)
-    print(f'Keys: {keys[:20]}')
+    print(f'Keys[:5]: {keys[:5]}')
     
     data_x_train = {k: data_x[k] for k in keys[:train_size]}
     data_y_train = {k: data_y[k] for k in keys[:train_size]}
@@ -282,14 +284,15 @@ def auto_train(data_path, save_path='model.pth', load_model: str | None = None):
 
     print(f'Length of data_x_train: {len(data_x_train)} / data_y_train: {len(data_y_train)}')
 
-    epoch = 1
-    while 1:
+    
+    for epoch in range(1, train_epochs + 1):
+        epoch_start_time = time.time()
         losses_for_epoch = []
-        for x, y in train_loader:
-            x, y = x.to('cuda'), y.to('cuda')
-            loss = model_training.train_step(x, y)
-            losses_for_epoch.append(loss.item())
-
+        if not eval_only:
+            for x, y in train_loader:
+                x, y = x.to('cuda'), y.to('cuda')
+                loss = model_training.train_step(x, y)
+                losses_for_epoch.append(loss.item())
         
         # Validation loop
         model_training.eval()
@@ -309,7 +312,10 @@ def auto_train(data_path, save_path='model.pth', load_model: str | None = None):
         save_p_2 = f'{base_save_path}_epoch_{epoch}.pth'
         model_training.save(save_p)
         model_training.save(save_p_2)
-        print(f"Epoch {epoch} completed.")
-        print(f'Training loss avg {sum(losses_for_epoch) / len(losses_for_epoch)} / min {min(losses_for_epoch)}/ max {max(losses_for_epoch)}')
+        print(f"Epoch {epoch} completed in {time.time() - epoch_start_time} seconds.")
+        print(f'Training loss avg {sum(losses_for_epoch) / len(losses_for_epoch)} / min {min(losses_for_epoch)}/ max {max(losses_for_epoch)}') if not eval_only else None
         print(f'Validation loss avg {sum(valid_losses) / len(valid_losses)} / min {min(valid_losses)}/ max {max(valid_losses)}')
         epoch += 1
+
+        if eval_only:
+            break
