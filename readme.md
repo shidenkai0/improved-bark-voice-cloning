@@ -1,5 +1,5 @@
 # Bark voice cloning
-
+This repository is a version of https://github.com/gitmylo/bark-voice-cloning-HuBERT-quantizer, but with improved training, leading to a higher quality Hubert quantizer for [suno/bark](https://github.com/suno-ai/bark). This leads to higher quality and more consistent voice cloning with Bark. 
 ## Please read
 This code works on python 3.10, i have not tested it on other versions. Some older versions will have issues.
 
